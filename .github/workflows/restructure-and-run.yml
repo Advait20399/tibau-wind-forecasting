@@ -1,0 +1,129 @@
+name: Restructure & Run Wind Forecasting
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: write   # allow committing moves/updates
+
+jobs:
+  restructure-and-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restructure repo to src/ and data/
+        run: |
+          set -e
+          mkdir -p src data artifacts/plots notebooks
+
+          # Move scripts if they exist at the root
+          for f in eda.py train_baseline.py train_lstm.py evaluate.py utils.py; do
+            if [ -f "$f" ]; then git mv "$f" src/; fi
+          done
+
+          # Move CSV if present at root
+          if [ -f tibau_wind_data.csv ]; then git mv tibau_wind_data.csv data/; fi
+
+          # Add a minimal Colab runner notebook
+          cat > notebooks/colab_runner.ipynb << 'NB'
+          {
+            "cells": [
+              {
+                "cell_type": "code",
+                "execution_count": null,
+                "metadata": {},
+                "outputs": [],
+                "source": [
+                  "!pip install -r requirements.txt"
+                ]
+              },
+              {
+                "cell_type": "code",
+                "execution_count": null,
+                "metadata": {},
+                "outputs": [],
+                "source": [
+                  "!python src/eda.py --csv data/tibau_wind_data.csv || true\n",
+                  "!python src/train_baseline.py --csv data/tibau_wind_data.csv --target wind_speed\n",
+                  "!python src/train_lstm.py --csv data/tibau_wind_data.csv --target wind_speed --window 24 --epochs 5\n",
+                  "!python src/evaluate.py --csv data/tibau_wind_data.csv --target wind_speed --window 24"
+                ]
+              }
+            ],
+            "metadata": {
+              "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+              "language_info": {"name": "python"}
+            },
+            "nbformat": 4,
+            "nbformat_minor": 5
+          }
+          NB
+
+          # Update README commands & add Colab badge (if not already present)
+          if [ -f README.md ]; then
+            if ! grep -q "colab.research.google.com/github/Advait20399/tibau-wind-forecasting" README.md; then
+              sed -i '1s|^|[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Advait20399/tibau-wind-forecasting/blob/main/notebooks/colab_runner.ipynb)\n\n|' README.md
+            fi
+            sed -i 's/python eda\.py/python src\/eda.py/g' README.md || true
+            sed -i 's/python train_baseline\.py/python src\/train_baseline.py/g' README.md || true
+            sed -i 's/python train_lstm\.py/python src\/train_lstm.py/g' README.md || true
+            sed -i 's/python evaluate\.py/python src\/evaluate.py/g' README.md || true
+            sed -i 's/tibau_wind_data\.csv/data\/tibau_wind_data.csv/g' README.md || true
+          fi
+
+          git add -A
+          git commit -m "Restructure: move scripts to src/, data to data/, add Colab notebook, update README" || echo "No changes to commit"
+          git push || echo "Push skipped (fork/permissions?)"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: EDA (optional)
+        run: python src/eda.py --csv data/tibau_wind_data.csv || echo "EDA skipped"
+
+      - name: Train baseline
+        run: python src/train_baseline.py --csv data/tibau_wind_data.csv --target wind_speed
+
+      - name: Train LSTM (CPU-friendly)
+        run: python src/train_lstm.py --csv data/tibau_wind_data.csv --target wind_speed --window 24 --epochs 5
+
+      - name: Compare models
+        run: python src/evaluate.py --csv data/tibau_wind_data.csv --target wind_speed --window 24
+
+      - name: Make paste-ready summary
+        run: |
+          python - << 'PY'
+          import json, pathlib
+          p = pathlib.Path("artifacts/metrics.json")
+          d = json.loads(p.read_text()) if p.exists() else {}
+          b, l = d.get("baseline", {}), d.get("lstm", {})
+          f = lambda x: "n/a" if x is None else (f"{x:.4f}" if isinstance(x,(int,float)) else str(x))
+          impr = None
+          if isinstance(b.get("MAE"),(int,float)) and isinstance(l.get("MAE"),(int,float)) and b["MAE"]>0:
+            impr = 100*(b["MAE"]-l["MAE"])/b["MAE"]
+          out = [
+            "## Automated Metrics (paste into QUESTION_SUMMARY.md)",
+            f"- Baseline ({b.get('model','?')}): MAE={f(b.get('MAE'))}, RMSE={f(b.get('RMSE'))}, MAPE={f(b.get('MAPE'))}",
+            f"- LSTM ({l.get('model','?')}): MAE={f(l.get('MAE'))}, RMSE={f(l.get('RMSE'))}, MAPE={f(l.get('MAPE'))}",
+          ]
+          if impr is not None:
+            out.append(f"- LSTM MAE improvement vs baseline: {impr:.2f}%")
+          pathlib.Path("artifacts/summary_to_paste.md").write_text("\n".join(out)+"\n")
+          print("\n".join(out))
+          PY
+
+      - name: Upload metrics & plots
+        uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: |
+            artifacts/metrics.json
+            artifacts/plots/**
+            artifacts/summary_to_paste.md
+            notebooks/colab_runner.ipynb
